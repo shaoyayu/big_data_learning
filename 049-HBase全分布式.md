@@ -91,7 +91,7 @@ node-c.example.com
 ```xml
 <property>
     <name>hbase.rootdir</name>
-    <value>hdfs://myhd/hbase</value>
+    <value>hdfs://mycluster/hbase</value>
 </property>
 <property>
     <name>hbase.cluster.distributed</name>
