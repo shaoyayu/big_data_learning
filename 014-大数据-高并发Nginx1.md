@@ -17,7 +17,7 @@ Nginx做为一个强大的Web服务器软件，具有高性能、高并发性和
 
 Tomcat 1000 < thhpd <nginx 5W
 
-![](images\Nginx的反向代理和负载均衡.png)
+![](images\Nginx的反向代理和负载均衡.png?raw=true)
 
 
 
