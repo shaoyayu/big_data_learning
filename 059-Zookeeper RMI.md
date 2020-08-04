@@ -153,3 +153,299 @@ public class  RmiClient {
 ```
 
 启动服务端后连接服务
+
+
+
+
+
+## Zookeeper 使用案例
+
+```java
+package demo.zookeeper.remoting.server;
+ 
+import demo.zookeeper.remoting.common.HelloService;
+ 
+public class Server {
+ 
+    public static void main(String[] args) throws Exception {
+//        if (args.length != 2) {
+//            System.err.println("please using command: java Server <rmi_host> <rmi_port>");
+//            System.exit(-1);
+//        }
+// 
+//        String host = args[0];
+//        int port = Integer.parseInt(args[1]);
+// 
+    	
+        String host = "192.168.133.1";//虚拟网卡可以和linux通讯的地址 
+        int port = Integer.parseInt("11214");//每启动一个server，端口号递增，手动启动
+        ServiceProvider provider = new ServiceProvider();
+ 
+        HelloService helloService = new HelloServiceImpl();
+        provider.publish(helloService, host, port);
+ 
+        Thread.sleep(Long.MAX_VALUE);
+    }
+}
+```
+
+
+
+```java
+package demo.zookeeper.remoting.common;
+ 
+public interface Constant {
+ 
+    String ZK_CONNECTION_STRING = "192.168.133.19:2181,192.168.133.20:2181,192.168.133.21:2181";
+    int ZK_SESSION_TIMEOUT = 5000;
+    String ZK_REGISTRY_PATH = "/registry";
+    String ZK_PROVIDER_PATH = ZK_REGISTRY_PATH + "/provider";
+}
+```
+
+
+
+```java
+package demo.zookeeper.remoting.common;
+ 
+import java.rmi.Remote;
+import java.rmi.RemoteException;
+ 
+public interface HelloService extends Remote {
+ 
+    String sayHello(String name) throws RemoteException;
+}
+```
+
+
+
+```java
+package demo.zookeeper.remoting.server;
+ 
+import demo.zookeeper.remoting.common.Constant;
+import java.io.IOException;
+import java.net.MalformedURLException;
+import java.rmi.Naming;
+import java.rmi.Remote;
+import java.rmi.RemoteException;
+import java.rmi.registry.LocateRegistry;
+import java.util.concurrent.CountDownLatch;
+import org.apache.zookeeper.CreateMode;
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.WatchedEvent;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.ZooDefs;
+import org.apache.zookeeper.ZooKeeper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+ 
+public class ServiceProvider {
+ 
+    private static final Logger LOGGER = LoggerFactory.getLogger(ServiceProvider.class);
+ 
+    private CountDownLatch latch = new CountDownLatch(1);
+ 
+    
+    /**
+     * 发布RMI服务，注册RMI地址到Zookeeper中
+     * @param remote HelloService对象
+     * @param host 服务器主机
+     * @param port 服务器端口
+     */
+    public void publish(Remote remote, String host, int port) {
+        String url = publishService(remote, host, port); 
+        if (url != null) {
+            ZooKeeper zk = connectServer();
+            if (zk != null) {
+                createNode(zk, url); 
+            }
+        }
+    }
+ 
+    // 发布RMI服务  注册端口 绑定对象
+    private String publishService(Remote remote, String host, int port) {
+        String url = null;
+        try {
+            url = String.format("rmi://%s:%d/%s", host, port, remote.getClass().getName());
+            LocateRegistry.createRegistry(port);
+            Naming.rebind(url, remote);
+            LOGGER.debug("publish rmi service (url: {})", url);
+        } catch (RemoteException | MalformedURLException e) {
+            LOGGER.error("", e);
+        }
+        return url;
+    }
+ 
+    // 连接 ZooKeeper 服务器 集群
+    private ZooKeeper connectServer() {
+        ZooKeeper zk = null;
+        try {
+            zk = new ZooKeeper(Constant.ZK_CONNECTION_STRING, Constant.ZK_SESSION_TIMEOUT, new Watcher() {
+                @Override
+                public void process(WatchedEvent event) {
+                    if (event.getState() == Event.KeeperState.SyncConnected) {
+                        latch.countDown(); //
+                    }
+                }
+            });
+            latch.await(); 
+        } catch (IOException | InterruptedException e) {
+            LOGGER.error("", e);
+        }
+        return zk;
+    }
+ 
+    // 带序列化的临时性节点
+    private void createNode(ZooKeeper zk, String url) {
+        try {
+            byte[] data = url.getBytes();
+            String path = zk.create(Constant.ZK_PROVIDER_PATH, data, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL_SEQUENTIAL);
+            LOGGER.debug("create zookeeper node ({} => {})", path, url);
+        } catch (KeeperException | InterruptedException e) {
+            LOGGER.error("", e);
+        }
+    }
+    
+    
+}
+```
+
+
+
+```java
+package demo.zookeeper.remoting.client;
+ 
+import demo.zookeeper.remoting.common.Constant;
+import java.io.IOException;
+import java.net.MalformedURLException;
+import java.rmi.ConnectException;
+import java.rmi.Naming;
+import java.rmi.NotBoundException;
+import java.rmi.Remote;
+import java.rmi.RemoteException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ThreadLocalRandom;
+import org.apache.zookeeper.KeeperException;
+import org.apache.zookeeper.WatchedEvent;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.ZooKeeper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+ 
+public class ServiceConsumer {
+ 
+    private static final Logger LOGGER = LoggerFactory.getLogger(ServiceConsumer.class);
+ 
+    private CountDownLatch latch = new CountDownLatch(1);
+ 
+    private volatile List<String> urlList = new ArrayList<>(); 
+ 
+    public ServiceConsumer() {
+        ZooKeeper zk = connectServer(); 
+        if (zk != null) {
+            watchNode(zk); 
+        }
+    }
+ 
+    // 查找 RMI 服务 
+    public <T extends Remote> T lookup() {
+        T service = null;
+        int size = urlList.size();
+        if (size > 0) {
+            String url;
+            if (size == 1) {
+                url = urlList.get(0); 
+                LOGGER.debug("using only url: {}", url);
+            } else {
+                url = urlList.get(ThreadLocalRandom.current().nextInt(size));
+                LOGGER.debug("using random url: {}", url);
+            }
+            System.out.println(url);
+            service = lookupService(url); 
+        }
+        return service;
+    }
+ 
+   
+    private ZooKeeper connectServer() {
+        ZooKeeper zk = null;
+        try {
+            zk = new ZooKeeper(Constant.ZK_CONNECTION_STRING, Constant.ZK_SESSION_TIMEOUT, new Watcher() {
+                @Override
+                public void process(WatchedEvent event) {
+                    if (event.getState() == Event.KeeperState.SyncConnected) {
+                        latch.countDown();
+                    }
+                }
+            });
+            latch.await(); 
+        } catch (IOException | InterruptedException e) {
+            LOGGER.error("", e);
+        }
+        return zk;
+    }
+    private void watchNode(final ZooKeeper zk) {
+        try {
+            List<String> nodeList = zk.getChildren(Constant.ZK_REGISTRY_PATH, new Watcher() {
+                @Override
+                public void process(WatchedEvent event) {
+                    if (event.getType() == Event.EventType.NodeChildrenChanged) {
+                        watchNode(zk);
+                    }
+                }
+            });
+            List<String> dataList = new ArrayList<>(); 
+            for (String node : nodeList) {
+                byte[] data = zk.getData(Constant.ZK_REGISTRY_PATH + "/" + node, false, null); 
+                dataList.add(new String(data));
+            }
+            LOGGER.debug("node data: {}", dataList);
+            urlList = dataList;
+        } catch (KeeperException | InterruptedException e) {
+            LOGGER.error("", e);
+        }
+    }
+    @SuppressWarnings("unchecked")
+    private <T> T lookupService(String url) {
+        T remote = null;
+        try {
+            remote = (T) Naming.lookup(url);
+        } catch (NotBoundException | MalformedURLException | RemoteException e) {
+            if (e instanceof ConnectException) {
+                LOGGER.error("ConnectException -> url: {}", url);
+                if (urlList.size() != 0) {
+                    url = urlList.get(0);
+                    return lookupService(url);
+                }
+            }
+            LOGGER.error("", e);
+        }
+        return remote;
+    }
+}
+```
+
+
+
+```java
+package demo.zookeeper.remoting.client;
+ 
+import demo.zookeeper.remoting.common.HelloService;
+ 
+public class Client {
+ 
+    public static void main(String[] args) throws Exception {
+        ServiceConsumer consumer = new ServiceConsumer();
+// zookeeper测试
+        while (true) {
+            HelloService helloService = consumer.lookup();
+            String result = helloService.sayHello("Jack");
+            System.out.println(result);
+            Thread.sleep(3000);
+        }
+    }
+}
+```
+
